@@ -33,8 +33,9 @@ la decisión de diseño detrás. El detalle técnico de cada punto está más ab
 | **Seguridad read-only del agente** (evitar mutaciones y SQL injection) | (1) Usuario PostgreSQL `insight_ro` con solo `SELECT`. (2) Lista blanca de tablas/columnas en la app. | **Defensa en profundidad**: si una capa falla, la otra protege. El candado a nivel de motor es infranqueable desde la app. |
 | **Text-to-SQL sin alucinaciones** | Few-shot prompting + validación contra lista blanca antes de ejecutar. | Los ejemplos en el prompt anclan al modelo a consultas correctas; la lista blanca bloquea cualquier SQL fuera de lo permitido. |
 | **Salida en formato JSON consistente** | El nodo de razonamiento estructura su respuesta final en JSON además del texto. | Facilita el consumo programático y el contraste con el endpoint `/metrics`. |
+| **Robustez ante datos incompletos** (no exigido explícitamente, pero mejora la calidad) | Se detectan en Python los KPIs en `null` y se interpretan como insumos faltantes; el JSON expone `missing_inputs`. | El agente distingue entre *dato faltante* y *resultado real* (evita interpretar un ROI sin inversión como una crisis). Detección determinista + refuerzo en el prompt. |
 
-*(Las decisiones de Fase 2 y 3 se documentarán en detalle al implementarlas.)*
+*(Las decisiones de Fase 3 se documentarán al implementarla.)*
 
 ---
 
@@ -128,9 +129,31 @@ agente:
 1. **Usuario PostgreSQL de solo lectura (`insight_ro`).** El agente se conecta
    con un rol que únicamente tiene permiso `SELECT`. Cualquier intento de
    `INSERT`/`UPDATE`/`DELETE` es rechazado por el motor de base de datos.
-2. **Lista blanca de tablas y columnas** (capa de aplicación, Fase 2). El
-   ejecutor de SQL validará las consultas contra un conjunto permitido antes de
-   ejecutarlas, mitigando SQL injection y alucinaciones del modelo.
+2. **Lista blanca de tablas y columnas** (capa de aplicación). El ejecutor de
+   SQL (`tools.py`) valida cada consulta antes de ejecutarla: debe ser una única
+   sentencia `SELECT`/`WITH`, sin palabras clave de escritura, y solo puede
+   referenciar tablas de la lista blanca. Mitiga SQL injection y alucinaciones
+   del modelo.
+
+### Agente (LangGraph) — Fase 2
+
+Grafo de estados con tres nodos:
+
+1. **Clasificación de intención** — decide si la pregunta pide datos, análisis o
+   una actualización, y rutea en consecuencia.
+2. **Text-to-SQL** — traduce lenguaje natural a SQL usando *few-shot prompting*
+   (esquema + ejemplos en el prompt) para reducir alucinaciones. El SQL generado
+   pasa por la lista blanca antes de ejecutarse con el usuario read-only.
+3. **Razonamiento** — analiza los datos y produce un diagnóstico de negocio con
+   recomendaciones, devolviendo **texto + JSON estructurado**. Antes de razonar,
+   detecta en Python los KPIs en `null` y los interpreta como *datos de entrada
+   faltantes* (no como resultados de cero): el JSON incluye un campo
+   `missing_inputs` y el prompt instruye al modelo a recomendar completar esos
+   datos en lugar de inventar cifras o declarar falsas alarmas.
+
+El LLM corre local con Ollama (`temperature=0` para maximizar la precisión del
+SQL). Si el modelo genera un SQL fuera de la lista blanca, el error se captura y
+se reporta de forma controlada en lugar de ejecutarse.
 
 ---
 
@@ -222,7 +245,8 @@ insight-extractor/
       hechos, vista de KPIs, validación (unificación, consistencia,
       deduplicación) e ingesta funcionando contra PostgreSQL.
 - [x] **Seguridad — Usuario read-only** de PostgreSQL creado y verificado.
-- [ ] **Fase 2 — Agente de IA (LangGraph):** nodos de intención, Text-to-SQL
-      seguro y razonamiento/recomendación.
+- [x] **Fase 2 — Agente de IA (LangGraph):** grafo de estados con nodos de
+      intención, Text-to-SQL (few-shot + lista blanca) y razonamiento con salida
+      dual texto + JSON. LLM local vía Ollama. Verificado de punta a punta.
 - [ ] **Fase 3 — API y DevOps:** endpoints FastAPI (`/chat`, `/data/ingest`,
       `/metrics`), Dockerfile, docker-compose completo y `ARCHITECTURE.md`.
