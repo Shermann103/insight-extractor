@@ -1,18 +1,26 @@
 """
-pipeline.py — Orquestación de la ingesta con gobernanza.
+pipeline.py — Orquestación de la ingesta con gobernanza (multi-fuente).
 
-Flujo:
-  1. Recibe registros crudos (de una fuente simulada: lista de dicts).
+Fuentes de datos:
+  - Fuente A (PostgreSQL / transaccional): ventas diarias -> ingest_sales().
+  - Fuente B (archivo estructurado CSV o API/JSON): inversión de marketing
+    por día y canal -> ingest_spend_from_csv() / ingest_spend_from_api().
+
+Flujo general:
+  1. Recibe registros crudos de cualquier fuente.
   2. Los valida con Pydantic (validator.py). Los inválidos se descartan y cuentan.
   3. Actualiza dimensiones con SCD tipo 2 (tarifas de canal).
-  4. Consolida ventas por (fecha, canal) y las carga a la tabla de hechos,
-     evitando duplicados (UPSERT sobre la restricción UNIQUE).
+  4. Consolida por (fecha, canal) y carga/actualiza la tabla de hechos con
+     UPSERT (evita duplicados). Las ventas y la inversión se unifican sobre la
+     misma fila (fecha, canal); los clics de ambas fuentes se suman.
 
 Devuelve un resumen con conteos, útil para el endpoint /data/ingest.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 from collections import defaultdict
 from datetime import date
 from typing import Any
@@ -26,7 +34,7 @@ from models import (
     FactCampaignPerformance,
     SessionLocal,
 )
-from validator import RawChannelRate, RawSalesRecord
+from validator import RawChannelRate, RawSalesRecord, RawSpendRecord
 
 
 # ---------------------------------------------------------------------------
@@ -190,3 +198,121 @@ def ingest_channel_rates(raw_rates: list[dict[str, Any]]) -> dict[str, int]:
         session.commit()
 
     return {"received": len(raw_rates), "valid": len(valid), "rejected": rejected}
+
+
+# ---------------------------------------------------------------------------
+# FUENTE B: inversión de marketing (CSV / API), unificada sobre la tabla de hechos
+# ---------------------------------------------------------------------------
+def _ingest_spend_records(raw_records: list[dict[str, Any]]) -> dict[str, int]:
+    """
+    Lógica común de ingesta de inversión, sin importar el formato de origen.
+
+    Valida con RawSpendRecord (misma gobernanza), consolida por (fecha, canal) y
+    fusiona sobre la tabla de hechos:
+      - marketing_spend e impresiones/impressions: se ACTUALIZAN (la inversión es
+        el dato autoritativo de esta fuente).
+      - num_clicks: se SUMA a los clics ya existentes (clics de ventas + de ads).
+    """
+    valid: list[RawSpendRecord] = []
+    rejected = 0
+    for rec in raw_records:
+        try:
+            valid.append(RawSpendRecord(**rec))
+        except ValidationError:
+            rejected += 1
+
+    # Consolidar por (fecha, canal)
+    buckets: dict[tuple[date, str], dict[str, float]] = defaultdict(
+        lambda: {"spend": 0.0, "clicks": 0, "impressions": 0}
+    )
+    for r in valid:
+        b = buckets[(r.event_date, r.channel)]
+        b["spend"] += r.spend
+        b["clicks"] += r.clicks
+        b["impressions"] += r.impressions
+
+    affected = 0
+    with SessionLocal() as session:
+        for (event_date, channel_code), agg in buckets.items():
+            channel_id = ensure_channel_exists(session, channel_code)
+
+            stmt = pg_insert(FactCampaignPerformance).values(
+                event_date=event_date,
+                channel_id=channel_id,
+                total_sales_amount=0,
+                marketing_spend=agg["spend"],
+                num_transactions=0,
+                num_new_customers=0,
+                num_clicks=int(agg["clicks"]),
+            )
+            # Si la fila (fecha, canal) ya existe:
+            #   - la inversión y las impresiones se SUMAN (una misma celda puede
+            #     recibir gasto desde varias fuentes: CSV + API),
+            #   - los clics también se SUMAN (clics de ventas + de ads).
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_fact_date_channel",
+                set_={
+                    "marketing_spend": FactCampaignPerformance.marketing_spend
+                    + agg["spend"],
+                    "num_clicks": FactCampaignPerformance.num_clicks
+                    + int(agg["clicks"]),
+                },
+            )
+            session.execute(stmt)
+            affected += 1
+
+        session.commit()
+
+    return {
+        "received": len(raw_records),
+        "valid": len(valid),
+        "rejected": rejected,
+        "fact_rows_affected": affected,
+    }
+
+
+def ingest_spend_from_csv(csv_content: str) -> dict[str, int]:
+    """
+    Ingesta inversión desde un CSV (archivo estructurado).
+
+    Columnas esperadas: date, channel, spend, impressions, clicks.
+    Se pasa el contenido del archivo como texto para no acoplar a rutas.
+    """
+    reader = csv.DictReader(io.StringIO(csv_content))
+    records: list[dict[str, Any]] = []
+    for row in reader:
+        records.append(
+            {
+                "event_date": row.get("date", "").strip(),
+                "channel": row.get("channel", "").strip(),
+                "spend": float(row.get("spend", 0) or 0),
+                "impressions": int(row.get("impressions", 0) or 0),
+                "clicks": int(row.get("clicks", 0) or 0),
+            }
+        )
+    result = _ingest_spend_records(records)
+    result["source"] = "csv"
+    return result
+
+
+def ingest_spend_from_api(api_payload: list[dict[str, Any]]) -> dict[str, int]:
+    """
+    Ingesta inversión desde una respuesta de API simulada (lista de objetos JSON).
+
+    Cada objeto debe traer: date/event_date, channel, spend, impressions, clicks.
+    Acepta tanto 'date' como 'event_date' para ser flexible con distintas APIs.
+    """
+    records: list[dict[str, Any]] = []
+    for item in api_payload:
+        records.append(
+            {
+                "event_date": item.get("event_date") or item.get("date"),
+                "channel": item.get("channel"),
+                "spend": item.get("spend", 0),
+                "impressions": item.get("impressions", 0),
+                "clicks": item.get("clicks", 0),
+            }
+        )
+    result = _ingest_spend_records(records)
+    result["source"] = "api"
+    return result

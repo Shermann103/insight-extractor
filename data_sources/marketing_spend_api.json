@@ -1,0 +1,5 @@
+[
+  {"event_date": "2026-08-01", "channel": "tiktok_ads", "spend": 18.75, "impressions": 5000, "clicks": 95},
+  {"event_date": "2026-08-01", "channel": "FB Ads", "spend": 10.00, "impressions": 3000, "clicks": 70},
+  {"event_date": "2026-07-30", "channel": "Google Ads", "spend": 55.20, "impressions": 8800, "clicks": 190}
+]

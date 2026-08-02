@@ -133,3 +133,46 @@ class RawChannelRate(BaseModel):
         if self.valid_from > date.today():
             raise ValueError(f"Fecha futura no permitida: {self.valid_from}")
         return self
+
+
+# ---------------------------------------------------------------------------
+# Esquema de un registro de inversión de marketing (Fuente B)
+# ---------------------------------------------------------------------------
+class RawSpendRecord(BaseModel):
+    """
+    Representa una fila cruda de inversión de marketing (Fuente B).
+
+    Llega desde un archivo estructurado (CSV) o una API simulada (JSON). Aplica
+    la MISMA gobernanza que la Fuente A: normaliza el canal, y rechaza gastos
+    negativos, clics/impresiones negativos y fechas futuras.
+    """
+    event_date: date
+    channel: str
+    spend: float
+    impressions: int = 0
+    clicks: int = 0
+
+    @field_validator("channel")
+    @classmethod
+    def _normalize_channel(cls, v: str) -> str:
+        return normalize_channel(v)
+
+    @field_validator("spend")
+    @classmethod
+    def _no_negative_spend(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"Gasto negativo no permitido: {v}")
+        return v
+
+    @field_validator("impressions", "clicks")
+    @classmethod
+    def _no_negative_counts(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"Valor negativo no permitido: {v}")
+        return v
+
+    @model_validator(mode="after")
+    def _no_future_dates(self) -> "RawSpendRecord":
+        if self.event_date > date.today():
+            raise ValueError(f"Fecha futura no permitida: {self.event_date}")
+        return self
