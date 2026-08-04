@@ -1,4 +1,4 @@
-﻿services:
+services:
   db:
     image: postgres:16
     container_name: insight_db
@@ -16,6 +16,32 @@
       interval: 5s
       timeout: 5s
       retries: 5
+
+  api:
+    build: .
+    container_name: insight_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Dentro de la red de Docker, la BD se llama "db" (no localhost).
+      POSTGRES_USER: ${POSTGRES_USER:-insight}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insight_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-insight_db}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_RO_USER: ${POSTGRES_RO_USER:-insight_ro}
+      POSTGRES_RO_PASSWORD: ${POSTGRES_RO_PASSWORD:-readonly_pass}
+      # Ollama corre en la máquina anfitriona (Windows), no en el contenedor.
+      # host.docker.internal permite al contenedor alcanzar el host.
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    extra_hosts:
+      # Necesario en Linux para que host.docker.internal funcione.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
 
 volumes:
   pgdata:

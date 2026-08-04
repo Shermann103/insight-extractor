@@ -1,553 +1,456 @@
 # Insight-Extractor & History Tracker
 
-Este proyecto es un sistema que **recoge datos de campañas de marketing y ventas,
-los limpia y organiza en una base de datos, y luego permite hacerle preguntas en
-lenguaje natural a un asistente de inteligencia artificial** que responde con
-análisis de negocio.
+Sistema de ingeniería de datos e inteligencia artificial que **extrae** datos de
+campañas de marketing y ventas desde varias fuentes, **garantiza su calidad**,
+los **modela** en una base de datos con históricos y KPIs, y expone un **agente
+de IA** conversacional a través de una API lista para producción.
 
-En pocas palabras: entra información desordenada de varias fuentes, sale
-información confiable y un asistente que la interpreta.
-
-Este documento explica, **punto por punto siguiendo el enunciado de la prueba**,
-qué se pedía, cómo se resolvió y qué decisiones se tomaron. Al final está la guía
-para instalarlo y ejecutarlo.
+En una frase: entra información desordenada de varias fuentes; sale información
+confiable, indicadores de negocio y un asistente que los interpreta.
 
 ---
 
-## El objetivo general
+## Stack tecnológico
 
-La prueba pide diseñar un sistema que haga cuatro cosas:
+| Área | Tecnología | Rol en el proyecto |
+|---|---|---|
+| **Base de datos** | PostgreSQL 16 | Almacena dimensiones, hechos e históricos. |
+| **Lenguaje** | Python 3.12 | Lenguaje base de todo el sistema. |
+| **API** | FastAPI | Expone los endpoints de forma asíncrona. |
+| **ORM** | SQLAlchemy | Mapea las tablas de la base de datos a objetos Python. |
+| **Framework de IA** | LangGraph (sobre LangChain) | Orquesta el agente como un grafo de estados. |
+| **LLM** | Ollama (`qwen2.5:7b`), local | Modelo de lenguaje sin API key ni costo por token. |
+| **Gobernanza / calidad** | Pydantic | Valida la calidad de los datos en la ingesta. |
+| **Migraciones** | Alembic | Versiona los cambios del esquema de la base de datos. |
+| **Infraestructura** | Docker / Docker Compose | Ejecución local reproducible; base para el despliegue. |
+| **Despliegue (teórico)** | GCP + Azure DevOps | Arquitectura de escalado y CI/CD (ver `ARCHITECTURE.md`). |
 
-1. **Extraer** datos de varias fuentes (una base de datos y archivos/APIs).
-2. **Garantizar la calidad** del dato antes de guardarlo (que no haya errores,
-   duplicados ni incoherencias).
-3. **Guardar y modelar** la información en una base de datos robusta, con
-   históricos y KPIs (indicadores de negocio).
-4. **Activar un agente de IA** que consulte esos datos, razone sobre ellos y
-   entregue reportes a través de una API web.
-
-El trabajo se divide en tres fases. Vamos una por una.
+El sistema está **dockerizado** para ejecución local con un solo comando, con una
+arquitectura pensada para escalar a **GCP** y un control de cambios bajo
+estándares de **Git / Azure DevOps**.
 
 ---
 
-# FASE 1 — Ingesta, Modelado de Datos y Gobernanza
+# Fase 1 — Ingesta, modelado de datos y gobernanza
 
-Esta fase construye la base: de dónde vienen los datos, cómo se limpian y cómo se
-guardan.
+## 1. Las fuentes de datos
 
-## Punto 1 — El origen de datos: dos fuentes
+El sistema unifica **dos fuentes** independientes de información:
 
-**Qué se pedía:** simular dos fuentes de información sobre campañas de marketing y
-ventas. El enunciado detalla una (Fuente A) y deja la otra abierta.
+### Fuente A — Ventas (transaccional)
 
-**Cómo se resolvió:**
+Representa los datos de ventas diarias que provendrían de un sistema
+transaccional (como el sistema de caja de una tienda). Cada registro trae: ID de
+transacción, cliente, monto, fecha y canal de venta. Se ingesta con la función
+`ingest_sales()`.
 
-- **Fuente A — Ventas (transaccional).** Son los datos de ventas diarias: número
-  de transacción, cliente, monto, fecha y canal por el que se vendió. Es la
-  fuente que el enunciado define explícitamente.
+### Fuente B — Inversión de marketing
 
-- **Fuente B — Inversión en publicidad.** Cuánto se gastó en anuncios, cuántas
-  veces se mostraron (impresiones) y cuántos clics generaron, por día y canal.
+Representa cuánto se gastó en publicidad, con impresiones y clics, por día y
+canal. El enunciado pide simular "ingesta web/API y archivos estructurados", por
+lo que la Fuente B se implementó en **dos formatos**:
 
-**Decisión que se tomó:** el enunciado no dice cuál es la segunda fuente, pero sí
-pide (más adelante) que la tabla final "unifique **ventas e inversión**". Las
-ventas ya venían de la Fuente A, así que dedujimos que la Fuente B debía ser la
-**inversión publicitaria**. Además, como el enunciado menciona "ingesta web/API y
-archivos estructurados", la Fuente B se hizo en **dos formatos** a la vez:
+- **Archivo estructurado (CSV):** `data_sources/marketing_spend.csv`, leído con
+  `ingest_spend_from_csv()`.
+- **API simulada (JSON):** `data_sources/marketing_spend_api.json`, leído con
+  `ingest_spend_from_api()`.
 
-- un archivo **CSV** (representa un archivo estructurado que alguien exporta),
-- un archivo **JSON** (representa la respuesta de una API web).
+Ambas fuentes son necesarias porque los KPIs combinan las dos: las ventas vienen
+de A y la inversión de B.
 
-Así quedan cubiertas ambas formas de ingesta que menciona la prueba.
+## 2. La capa de validación (gobernanza)
 
-## Punto 2 — Gobernanza de datos (que el dato sea confiable)
+Toda la información, sin importar la fuente, pasa por un **filtro de calidad**
+antes de entrar a la base de datos. Está implementado con **Pydantic** en
+`validator.py` y garantiza tres cosas:
 
-**Qué se pedía:** una capa de validación que garantice tres cosas antes de
-guardar cualquier dato.
+### Unificación (normalización de canales)
 
-**Cómo se resolvió:** se creó un "filtro de calidad" (usando la herramienta
-Pydantic) por el que pasa **todo** dato de ambas fuentes antes de entrar a la base
-de datos. Ese filtro revisa tres cosas:
+El mismo canal llega escrito de muchas formas distintas. Un diccionario de
+equivalencias (`CHANNEL_MAP`) normaliza el texto (minúsculas, sin espacios
+sobrantes) y lo homologa a un valor estándar:
 
-### a) Unificar los nombres de los canales
-
-El problema: el mismo canal llega escrito de mil formas. "FB Ads", "facebook_ads"
-y "Facebook" son todos el mismo canal, pero un computador los ve como distintos.
-
-La solución: una "tabla de traducción" que convierte todas las variantes a un
-nombre único y estándar.
-
-| Cómo llega escrito | Cómo se guarda |
+| Cómo llega | Se guarda como |
 |---|---|
 | FB Ads, facebook_ads, Facebook, fb | **FACEBOOK** |
 | google ads, AdWords, google_ads | **GOOGLE** |
 | ig, instagram_ads | **INSTAGRAM** |
 | tik tok, tiktok_ads | **TIKTOK** |
 
-**Decisión:** si llega un canal que no está en la tabla de traducción, **no se
-descarta**; se guarda igual pero estandarizado (en mayúsculas). Así no se pierde
-información aunque aparezca un canal nuevo.
+Si llega un canal que no está en el diccionario, **no se descarta**: se
+estandariza igual (mayúsculas, guiones bajos) para no perder el dato.
 
-### b) Coherencia: rechazar datos imposibles
+### Consistencia (validaciones nativas con Pydantic)
 
-Se rechazan automáticamente:
+Los validadores de Pydantic (`field_validator` y `model_validator`) rechazan
+automáticamente los datos incoherentes:
 
-- Ventas o gastos con **montos negativos** (no existe vender −50 pesos).
-- Registros con **fecha futura** (no se pueden tener ventas de mañana).
+- **Montos negativos** en ventas o inversión (`amount < 0`, `spend < 0`).
+- **Fechas futuras** (`event_date > hoy`).
+- Clics o impresiones negativos.
 
-**Decisión:** si un registro viene mal, **se descarta solo ese** y se sigue con
-los demás. Un dato malo no arruina toda la carga. Al final, el sistema informa
-cuántos registros entraron y cuántos se rechazaron.
+La validación es **por registro**: si uno viene mal, se descarta y se cuenta,
+pero no se cae todo el lote. Cada ingesta devuelve un resumen
+`{received, valid, rejected}`.
 
-### c) Evitar duplicados
+### Duplicados
 
-El problema: si por error se carga el mismo dato dos veces, no debe duplicarse en
-la base.
+Se evitan a **nivel de base de datos**, que es el lugar más robusto:
 
-La solución: la base de datos tiene una **regla de unicidad** por día y canal. Si
-llega un dato para un día y canal que ya existen, en vez de crear una fila
-repetida, **actualiza la que ya está**.
+- En `fact_campaign_performance`, una restricción `UNIQUE(event_date, channel_id)`
+  impide dos filas para el mismo día y canal. La carga usa un **UPSERT**
+  (`INSERT ... ON CONFLICT DO UPDATE`): si la combinación ya existe, actualiza la
+  fila en lugar de duplicarla.
+- En `dim_channel`, la función `ensure_channel_exists()` comprueba si el canal ya
+  existe antes de crearlo, evitando canales repetidos.
 
-**Decisión:** esta regla se puso **en la base de datos misma**, no solo en el
-código. Es más seguro: aunque el programa fallara, la base nunca aceptaría un
-duplicado.
+## 3. Modelado del histórico y KPIs
 
-## Punto 3 — Modelado del histórico y KPIs
-
-**Qué se pedía:** diseñar las tablas con SQLAlchemy, con una tabla de hechos, un
-histórico de cambios (SCD) y una vista de KPIs.
-
-Antes de los detalles, así se ven las tablas y cómo se conectan:
+Todo el esquema se define con **SQLAlchemy** en `src/data/models.py`. Consta de
+tres tablas y una vista:
 
 ```
-   dim_channel (catálogo de canales)      dim_customer (catálogo de clientes)
-   ┌───────────────────────────┐          ┌───────────────────────────┐
-   │ nombre del canal          │          │ código del cliente        │
-   │ costo por clic (CPC)      │          │ segmento, ciudad          │
-   │ desde / hasta / vigente   │          │ desde / hasta / vigente   │
-   └─────────────┬─────────────┘          └───────────────────────────┘
-                 │  un canal aparece en muchos días
-                 │
-                 ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │ fact_campaign_performance (tabla principal de datos)    │
-   │                                                         │
-   │ fecha + canal  ← identifican cada fila (sin duplicados) │
-   │ ventas totales        ← viene de la Fuente A            │
-   │ inversión (gasto)     ← viene de la Fuente B            │
-   │ nº transacciones      ← Fuente A                        │
-   │ nº clientes nuevos    ← Fuente A                        │
-   │ nº de clics           ← Fuente A + Fuente B (se suman)  │
-   └─────────────────────────────┬───────────────────────────┘
-                                 │
-                                 ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │ vw_campaign_kpis (vista que calcula los indicadores)    │
-   │ ROI · CAC · Tasa de conversión                          │
-   └─────────────────────────────────────────────────────────┘
+   dim_channel (SCD tipo 2)              dim_customer (SCD tipo 2)
+   catálogo de canales + tarifas         catálogo de clientes
+          │
+          │ 1 canal → N filas de hechos (clave foránea channel_id)
+          ▼
+   fact_campaign_performance  ← unifica Fuente A (ventas) + Fuente B (inversión)
+          │
+          ▼
+   vw_campaign_kpis  → calcula ROI, CAC y conversión (vista, no tabla)
 ```
 
-### ¿Qué es cada tabla y para qué sirve?
+### Tabla de hechos: `fact_campaign_performance`
 
-Hay tres tipos de tablas, con roles distintos:
+Es la tabla central. Cada fila representa el desempeño de **un canal en un día**
+(su "grano"). Unifica las dos fuentes sobre la misma fila `(event_date,
+channel_id)`:
 
-- **Tablas de catálogo (dimensiones):** describen las "cosas" del negocio.
-  - `dim_channel` — el catálogo de canales de marketing y su costo por clic.
-  - `dim_customer` — el catálogo de clientes y sus datos (segmento, ciudad).
+- La **Fuente A** llena las columnas de ventas: `total_sales_amount`,
+  `num_transactions`, `num_new_customers`.
+- La **Fuente B** llena las columnas de inversión: `marketing_spend`,
+  `num_clicks` (impresiones).
 
-- **Tabla principal (de hechos):** `fact_campaign_performance` guarda los números
-  medibles (ventas, inversión, clics...) de cada día y canal. Es el corazón del
-  sistema.
+Cada fuente escribe solo sus propias columnas; por eso son independientes y el
+orden de ingesta no altera el resultado. El único campo que ambas comparten es
+`num_clicks`, que se **acumula**. Así, una fila queda completa con datos de
+ambas fuentes, lista para calcular los KPIs.
 
-- **Vista de indicadores:** `vw_campaign_kpis` no guarda datos, los **calcula**
-  automáticamente a partir de la tabla principal.
+### Histórico SCD tipo 2: `dim_channel`
 
-### ¿Cómo se relacionan?
+Esta tabla guarda el histórico de las tarifas de canal (costo por clic) **sin
+sobrescribir el pasado**. Cuando la tarifa de un canal cambia, en lugar de
+reemplazar el valor anterior, se **cierra** la versión vigente y se **crea** una
+nueva. Cada versión lleva tres marcas:
 
-La tabla principal está conectada al catálogo de canales: cada fila de datos
-"apunta" a un canal del catálogo (esto se llama *clave foránea*). Un canal puede
-tener muchos días de datos, pero cada dato pertenece a un solo canal.
-
-### ¿Cómo se llenan?
-
-| Tabla | Cómo se llena | Con datos de |
-|---|---|---|
-| `dim_channel` | Al cargar tarifas o cuando aparece un canal nuevo | Tarifas de canal |
-| `dim_customer` | Al cargar clientes | Datos de clientes |
-| `fact_campaign_performance` | Con las funciones de ingesta de ventas e inversión | Fuentes A y B |
-| `vw_campaign_kpis` | No se llena: se calcula sola | Deriva de la tabla principal |
-
-**Cómo se combinan las dos fuentes:** las ventas (Fuente A) y la inversión
-(Fuente B) escriben sobre la **misma fila** (identificada por día + canal). Cada
-fuente llena sus propias columnas: A pone las ventas, B pone el gasto. Son
-**independientes** (no dependen una de la otra) y **da igual cuál se cargue
-primero**: el resultado final es el mismo. Lo único que ambas comparten son los
-clics, que se **suman** entre las dos.
-
-> **Nota honesta:** como los clics y el gasto se suman, la carga de inversión
-> está pensada para hacerse **una vez por lote de datos**. Si se corriera dos
-> veces sobre lo mismo, sumaría de nuevo. En un sistema de producción esto se
-> controlaría marcando los lotes ya procesados.
-
-### El histórico de cambios (SCD tipo 2)
-
-**Qué se pedía:** guardar el histórico de cambios sin borrar el pasado. Ejemplo
-del enunciado: si el costo por clic de un canal cambia el mes siguiente, no se
-debe sobrescribir el valor anterior.
-
-**Cómo se resolvió:** en vez de reemplazar el dato viejo, se **cierra** y se crea
-uno nuevo. Cada versión lleva tres marcas: desde cuándo aplica, hasta cuándo
-aplicó, y si es la versión vigente.
+- `valid_from` — desde cuándo aplica.
+- `valid_to` — hasta cuándo aplicó (`NULL` = versión vigente).
+- `is_current` — bandera de la versión actual.
 
 Ejemplo — el costo por clic de Facebook sube en febrero:
 
-| Canal | Costo por clic | Desde | Hasta | ¿Vigente? |
+| channel_code | base_cpc | valid_from | valid_to | is_current |
 |---|---|---|---|---|
-| FACEBOOK | 0.50 | 1 ene | 31 ene | No |
-| FACEBOOK | 0.70 | 1 feb | *(sigue)* | Sí |
+| FACEBOOK | 0.50 | 2026-01-01 | 2026-01-31 | false |
+| FACEBOOK | 0.70 | 2026-02-01 | *(null)* | true |
 
-Así, el ROI de enero se puede recalcular con el costo que aplicaba **en enero**,
-sin que el cambio de febrero lo distorsione.
+De este modo, el ROI de enero se puede recalcular con la tarifa que aplicaba en
+enero. (El mismo patrón está disponible en `dim_customer` para el histórico de
+clientes.)
 
-**Decisión:** el enunciado pedía hacerlo sobre clientes **o** canales; se hizo
-sobre **ambos** para demostrar mejor el manejo del patrón.
+### KPIs calculados: la vista `vw_campaign_kpis`
 
-### Los KPIs (indicadores de negocio)
+Los indicadores se calculan con una **vista** (una consulta SQL guardada), no una
+tabla. La ventaja: los KPIs siempre reflejan los datos más recientes sin
+duplicar información. La vista toma cada fila de la tabla de hechos, la une con
+`dim_channel` para traer el nombre del canal, y añade tres columnas calculadas:
 
-**Qué se pedía:** una vista que calcule automáticamente ROI, CAC y tasa de
-conversión.
+| KPI | Fórmula |
+|---|---|
+| **ROI** | (ventas − inversión) / inversión |
+| **CAC** | inversión / clientes nuevos |
+| **Conversión** | transacciones / clics |
 
-**Cómo se resolvió:** la vista `vw_campaign_kpis` los calcula así:
-
-| Indicador | Qué mide | Cómo se calcula |
-|---|---|---|
-| **ROI** | Retorno de la inversión | (ventas − inversión) / inversión |
-| **CAC** | Costo de conseguir un cliente | inversión / clientes nuevos |
-| **Conversión** | % de clics que se vuelven venta | transacciones / clics |
-
-**Decisión:** se usó una **vista** (una consulta guardada que se calcula al
-momento) en lugar de una tabla, para que los indicadores siempre reflejen los
-datos más recientes sin tener que recalcularlos a mano. Además, si algún divisor
-es cero (por ejemplo, un canal sin clientes nuevos), el sistema devuelve "sin
-dato" en lugar de dar un error.
+Cada división usa `NULLIF(divisor, 0)`: si el divisor es cero (p. ej., un canal
+sin clientes nuevos), devuelve `NULL` en lugar de dar un error.
 
 ---
 
-# FASE 2 — El Agente de Inteligencia Artificial
+# Fase 2 — El agente de IA (LangGraph)
 
-Una vez los datos están limpios y guardados, esta fase construye el asistente que
-los interpreta.
+## Diseño del agente
 
-**Qué se pedía:** un agente conversacional (con LangGraph) que reciba preguntas
-en lenguaje natural y tenga varios "pasos de pensamiento".
+El agente se construyó con **LangGraph**, que lo organiza como un **grafo de
+estados**: un diagrama de flujo que se ejecuta de verdad, donde la información
+pasa por nodos conectados. Un "expediente" compartido (el estado) viaja de nodo
+en nodo, y cada uno le agrega su resultado.
 
-**Cómo se resolvió:** el agente funciona como una línea de montaje con tres
-estaciones (nodos), tal como pide el enunciado:
+### Herramientas del agente y cómo accede a ellas
 
-1. **Estación 1 — Entender la intención.** Lee la pregunta y decide qué quiere el
-   usuario: ¿datos concretos?, ¿un análisis estratégico?, ¿actualizar algo?
+La herramienta del agente es la función que consulta la base de datos de forma
+segura (`run_readonly_sql`, en `src/ai/tools.py`). A diferencia del enfoque donde
+el modelo "decide solo" cuándo usar herramientas, aquí **el código las invoca en
+el momento correcto del flujo**. Se eligió así porque los modelos pequeños (7B)
+suelen equivocarse al decidir cuándo llamar herramientas; controlarlo en el
+código hace el flujo predecible y seguro.
 
-2. **Estación 2 — Traducir a SQL.** Convierte la pregunta en lenguaje humano
-   ("¿cuál es el ROI por canal?") en una consulta técnica a la base de datos.
-
-3. **Estación 3 — Razonar y recomendar.** Toma los datos que obtuvo y redacta un
-   diagnóstico de negocio con recomendaciones.
-
-A continuación se explica **cómo funciona cada mecanismo por dentro** (todo el
-código está en `src/ai/agent.py`).
-
-## Cómo se construyó el agente con LangGraph
-
-LangGraph organiza al agente como un **diagrama de flujo que se ejecuta de
-verdad**: cajas (nodos) conectadas por flechas (por dónde va la información).
-
-La pieza central es el **"expediente" compartido** (en el código, `AgentState`):
-un paquete de información que viaja de estación en estación. Empieza conteniendo
-solo la pregunta del usuario, y cada estación le va agregando su resultado
-(primero la intención, luego el SQL, luego los datos, al final la respuesta).
+### El grafo de estados y sus nodos
 
 ```
    Pregunta del usuario
           │
           ▼
-   ┌──────────────────┐
-   │ 1. Intención     │  ¿datos, análisis o actualización?
-   └────────┬─────────┘
-            │  (flecha que se bifurca según la intención)
-      ┌─────┴─────────────────┐
-      ▼                       ▼
-  (actualización)      (datos / análisis)
-      │                       │
-      │                 ┌─────────────┐
-      │                 │ 2. Text-to- │  traduce a SQL y lo ejecuta seguro
-      │                 │    SQL      │
-      │                 └──────┬──────┘
-      │                        │
-      └───────────┬────────────┘
-                  ▼
-          ┌──────────────┐
-          │ 3. Razonar   │  genera diagnóstico + JSON
-          └──────┬───────┘
-                 ▼
-             Respuesta
+   [ Nodo 1: Clasificación de intención ]
+          │  (se bifurca según la intención)
+      ┌───┴────────────┐
+      ▼                ▼
+ (actualización)   (datos / análisis)
+      │                ▼
+      │      [ Nodo 2: Text-to-SQL ]
+      │                │
+      └───────┬────────┘
+              ▼
+   [ Nodo 3: Razonamiento y recomendación ]
+              │
+              ▼
+          Respuesta (texto + JSON)
 ```
 
-> **Detalle técnico — el grafo.** Se define con `StateGraph(AgentState)`. Se
-> registran los nodos con `add_node()`, se conectan con `add_edge()`, y la
-> bifurcación de la estación 1 se hace con `add_conditional_edges()`. Al final
-> `compile()` lo vuelve ejecutable. El grafo se invoca con `agent_app.invoke(...)`.
+**Nodo 1 — Clasificación de intención.** Le pregunta al modelo si la consulta del
+usuario es de tipo `data` (datos duros), `analysis` (análisis estratégico de
+KPIs) o `update` (tarea de actualización). Como el modelo a veces responde de
+más, el código no confía ciegamente: busca cuál de las tres palabras aparece en
+la respuesta. Según el resultado, una bifurcación decide el camino: `update` va
+directo a la respuesta (el agente es de solo lectura); `data` y `analysis` pasan
+al nodo de SQL.
 
-### Sobre las "herramientas" (tools) del agente
+**Nodo 2 — Text-to-SQL controlado.** Traduce la pregunta en lenguaje natural a
+una consulta SQL. Para evitar que el modelo "alucine" (invente tablas o
+columnas), la instrucción incluye tres ingredientes:
 
-El enunciado pide un agente "con acceso a herramientas". Su herramienta es la
-función que consulta la base de datos de forma segura (`run_readonly_sql`, en
-`src/ai/tools.py`).
+1. El rol y la orden clara ("genera una consulta SELECT, responde solo con SQL").
+2. El **esquema** de la base (las tablas y columnas reales disponibles).
+3. Ejemplos resueltos — la técnica de **Few-Shot prompting**: se le muestran
+   varios pares de *pregunta → SQL correcto* antes de su tarea, y el modelo imita
+   el patrón. Es enseñar con ejemplos en lugar de con reglas abstractas.
 
-> **Decisión de diseño (importante).** Hay dos formas de darle herramientas a un
-> agente: (a) dejar que el **modelo decida solo** cuándo usarlas, o (b) que el
-> **código las invoque** en el momento correcto del flujo. Elegimos la opción (b):
-> el nodo de SQL llama a la herramienta directamente. ¿Por qué? Los modelos
-> pequeños (como el nuestro, de 7B) suelen equivocarse al decidir cuándo y cómo
-> llamar herramientas. Al controlarlo nosotros en el código, el flujo es
-> **predecible y seguro**. Ganamos control y seguridad a cambio de menos
-> autonomía del modelo — un intercambio deseable para un sistema que toca una
-> base de datos.
+El SQL generado nunca se ejecuta a ciegas: pasa primero por las validaciones de
+seguridad (ver más abajo). Si el modelo genera algo no permitido, se rechaza y se
+reporta el error de forma controlada.
 
-## Estación 1: cómo se determina la intención
+**Nodo 3 — Razonamiento y recomendación.** Toma los datos que devolvió la
+consulta, analiza los KPIs y genera un **diagnóstico de negocio** con
+recomendaciones de optimización (por ejemplo, en qué canal invertir más y en cuál
+menos). Antes de razonar, detecta los KPIs en `NULL` y los interpreta como datos
+faltantes, no como resultados de cero, para no generar falsas alarmas.
 
-Se le envía al modelo una instrucción corta: *"clasifica esta pregunta en UNA
-palabra: `data` (datos duros), `analysis` (análisis de KPIs) o `update`
-(actualización)"*, junto con la pregunta del usuario. Estas son exactamente las
-tres categorías que pide el enunciado.
+## Políticas de gobernanza en el consumo de IA
 
-Como los modelos a veces responden de más ("La intención es data porque..."), **no
-se confía ciegamente** en la respuesta: el código busca cuál de las tres palabras
-aparece y esa es la intención elegida. Si no aparece ninguna, se usa `analysis`
-por defecto (la opción más segura, porque desemboca igual en una consulta de
-datos).
+### Cómo se evitan SQL injection y mutaciones accidentales
 
-Luego, una **flecha que se bifurca** usa esa intención: si es `update`, va directo
-a la respuesta (actualizar datos no es tarea de un agente de solo lectura; eso lo
-hará el endpoint `/data/ingest` en la Fase 3); si es `data` o `analysis`, pasa a
-la estación de SQL.
+Se aplica **defensa en profundidad**, con dos capas independientes:
 
-## Estación 2: cómo se traduce lenguaje natural a SQL (Text-to-SQL)
+1. **Usuario de base de datos de solo lectura (`insight_ro`).** El agente se
+   conecta con un rol que solo tiene permiso `SELECT`. Cualquier intento de
+   `INSERT`, `UPDATE` o `DELETE` es rechazado por el propio motor de PostgreSQL.
+2. **Lista blanca en la aplicación (`tools.py`).** Antes de ejecutar, cada
+   consulta se valida: debe ser una única sentencia `SELECT`/`WITH`, sin palabras
+   de escritura, y solo puede referenciar tablas permitidas.
 
-Esta es la parte más delicada, porque un modelo puede "alucinar" (inventar tablas
-o columnas que no existen). Para evitarlo, la instrucción que se le da tiene **tres
-ingredientes**:
+Si una capa fallara, la otra sigue protegiendo. El candado a nivel de motor es
+infranqueable desde la aplicación.
 
-1. **El rol y la orden clara:** "eres experto en PostgreSQL, genera UNA sola
-   consulta de solo lectura (SELECT), responde solo con el SQL".
+### Formato de la salida
 
-2. **El mapa de la base de datos:** se le muestran las tablas y columnas que
-   existen realmente. Sin esto, inventaría nombres. Con esto, se limita a lo real.
+El agente estructura su respuesta en **dos formatos a la vez**:
 
-3. **Ejemplos resueltos (la técnica *Few-Shot*):** esto es lo que pide
-   explícitamente el enunciado. "Few-shot" significa **enseñar con ejemplos** en
-   lugar de con reglas. Se le muestran varios pares de *pregunta → SQL correcto*
-   antes de su tarea, y el modelo **imita el patrón**. Es como mostrarle a alguien
-   tres ejercicios resueltos antes de pedirle que resuelva el cuarto.
+- Un **texto** en lenguaje natural (el diagnóstico, para una persona).
+- Un **JSON estructurado**, para consumo programático, con esta forma:
 
-Ejemplos que se le dan al modelo (few-shot):
+```json
+{
+  "status": "ok",
+  "intent": "data",
+  "sql": "SELECT channel_code, roi FROM vw_campaign_kpis ...",
+  "data": { "columns": [...], "rows": [...], "row_count": 4 },
+  "missing_inputs": [],
+  "diagnosis": "Texto del diagnóstico de negocio..."
+}
+```
 
-| Pregunta de ejemplo | SQL que se le muestra como correcto |
-|---|---|
-| ¿Cuál es el ROI por canal? | `SELECT channel_code, roi FROM vw_campaign_kpis;` |
-| ¿Qué canal tuvo más ventas? | `SELECT channel_code, SUM(total_sales_amount) ... GROUP BY ...` |
-| Tarifas vigentes de canales | `SELECT channel_code, base_cpc FROM dim_channel WHERE is_current = true;` |
-
-Después, la respuesta del modelo se **limpia** (se le quitan explicaciones o
-adornos de formato y se toma solo la consulta).
-
-> **Seguridad — el SQL no se ejecuta a ciegas.** La consulta generada pasa
-> primero por los dos candados (lista blanca + usuario de solo lectura, descritos
-> abajo). Si el modelo generó algo no permitido, **se rechaza y se reporta el
-> error de forma controlada**, en vez de ejecutarlo. Así, aunque el modelo se
-> equivoque, la base de datos queda protegida.
-
-## Estación 3: cómo se generan los reportes y dónde queda el JSON
-
-La última estación toma los datos que trajo la consulta y produce **dos salidas a
-la vez**:
-
-- **Un texto** en lenguaje natural: el diagnóstico de negocio con recomendaciones,
-  escrito para que lo lea una persona. Se genera con una instrucción que le dice al
-  modelo "actúa como analista de negocio y redacta un diagnóstico con estos datos".
-
-- **Un JSON estructurado**: un paquete de datos ordenado, pensado para que otro
-  programa lo consuma. Contiene: el estado, la intención detectada, el SQL que se
-  usó, los datos crudos, la lista de datos faltantes (si los hay) y el diagnóstico.
-
-> **¿Dónde queda ese JSON?** Por ahora, el agente lo **devuelve en memoria**: la
-> función `run_agent()` lo retorna a quien la llame, y al probar por consola se
-> imprime en pantalla. Todavía **no se guarda en disco ni se expone por web**. Eso
-> es justo lo que hará la **Fase 3**: el endpoint `/chat` tomará este mismo JSON y
-> lo entregará como respuesta de la API. En otras palabras, el agente ya *produce*
-> el reporte estructurado; la Fase 3 solo lo *publicará*.
-
-## Seguridad: que el agente solo pueda mirar, no tocar
-
-**Qué se pedía:** que el agente sea de **solo lectura**, para evitar que borre o
-modifique datos por error, y protegerlo de ataques (SQL injection).
-
-**Cómo se resolvió:** con **dos candados independientes**:
-
-1. **Un usuario de base de datos que solo puede leer.** Aunque el agente
-   intentara borrar algo, la base de datos se lo impediría.
-
-2. **Una lista blanca en el código.** Antes de ejecutar cualquier consulta, el
-   sistema revisa que sea solo de lectura y que use únicamente las tablas
-   permitidas. Cualquier cosa sospechosa se bloquea antes de llegar a la base.
-
-> **Decisión:** dos candados en lugar de uno. Si un candado fallara, el otro
-> sigue protegiendo. Es el principio de "defensa en profundidad".
-
-## Respuesta en dos formatos
-
-**Qué se pedía:** que el agente responda en JSON (formato para programas) además
-del texto en lenguaje natural.
-
-**Cómo se resolvió:** cada respuesta trae las dos cosas: el diagnóstico escrito
-para que lo lea una persona, y un bloque JSON estructurado (con la consulta usada,
-los datos y el análisis) para que lo consuma otro programa.
-
-**Mejora extra:** el agente distingue entre "el resultado es cero" y "falta el
-dato para calcularlo". Si un indicador no se puede calcular porque falta
-información, lo dice claramente en lugar de inventar una alarma falsa.
+El campo `missing_inputs` lista los KPIs que no se pudieron calcular por falta de
+datos, y `sql` deja trazado exactamente qué consulta se ejecutó.
 
 ---
 
-# FASE 3 — API, Exposición e Integración
+# Fase 3 — API, exposición e integración
 
-*(En construcción.)*
+El sistema es accesible de forma programática mediante una **API con FastAPI**
+(`src/main.py`), lista para producción. Expone tres endpoints.
 
-**Qué se pedirá:** exponer todo a través de una API web con tres puertas de
-entrada (endpoints):
+## `POST /chat` — conversar con el agente
 
-- `/chat` — para conversar con el agente de IA.
-- `/data/ingest` — para disparar la carga y validación de datos.
-- `/metrics` — para obtener los KPIs directamente de la base (y poder
-  contrastarlos con lo que dice el agente).
+Interactúa con el agente de LangGraph de forma **asíncrona**. El endpoint está
+declarado como `async`, pero el agente (que llama a Ollama) es una operación
+bloqueante; para no congelar el servidor mientras el modelo piensa, la llamada se
+ejecuta en un **hilo aparte** (`run_in_threadpool`). Así el servidor sigue
+atendiendo otras peticiones mientras el agente trabaja. Recibe una pregunta y
+devuelve el diagnóstico en texto + el JSON estructurado.
 
-Y además: un `docker-compose.yml` que levante todo junto (base de datos +
-migraciones + API) y un documento `ARCHITECTURE.md` que explique cómo se escalaría
-en la nube (GCP) y cómo sería el pipeline de despliegue (CI/CD en Azure DevOps).
+## `POST /data/ingest` — disparar la ingesta
+
+Dispara todo el proceso de ingesta con gobernanza. En el cuerpo de la petición se
+envía lo que se quiera cargar (ventas, tarifas de canal, inversión por API o
+CSV), y el endpoint:
+
+1. **Valida** cada registro con la capa de gobernanza (unificación de canales,
+   rechazo de negativos y fechas futuras, descritos en la Fase 1).
+2. **Consolida** los datos por día y canal.
+3. **Actualiza los históricos:** las tarifas de canal se procesan con la lógica
+   SCD tipo 2 (si el costo por clic cambió, se cierra la versión vigente y se abre
+   una nueva, sin borrar el pasado); la tabla de hechos se actualiza con UPSERT
+   (sin duplicar).
+
+Devuelve un resumen por fuente con los conteos de recibidos, válidos y rechazados.
+
+## `GET /metrics` — KPIs actuales
+
+Devuelve, en formato JSON, los KPIs actuales (ROI, CAC, conversión) **calculados
+directamente en la base de datos** (leyendo la vista `vw_campaign_kpis` con el
+usuario de solo lectura). Sirve para **contrastar** los números reales de la base
+con lo que responde el agente de IA.
+
+## Arquitectura y DevOps
+
+### El `docker-compose.yml`
+
+Levanta todo el sistema con un solo comando (`docker compose up`). Define dos
+servicios que arrancan en orden:
+
+1. **`db`** — el contenedor de PostgreSQL. Tiene un *healthcheck* que avisa
+   cuándo la base está realmente lista para aceptar conexiones.
+2. **`api`** — el contenedor de la aplicación. Gracias a `depends_on: condition:
+   service_healthy`, **espera a que la base esté sana** antes de arrancar. Al
+   iniciar, su `entrypoint.sh` ejecuta tres pasos en secuencia:
+   1. espera a PostgreSQL,
+   2. ejecuta las **migraciones de Alembic** (crea las tablas, la vista de KPIs y
+      el usuario de solo lectura),
+   3. inicia el servidor **FastAPI** con uvicorn.
+
+El agente sigue usando el Ollama que corre en la máquina anfitriona; el contenedor
+lo alcanza mediante `host.docker.internal`.
+
+### Escalado en la nube y CI/CD
+
+El documento `ARCHITECTURE.md` describe cómo se escalaría la solución en **GCP**
+(Cloud Run, Cloud SQL, BigQuery, dbt, Vertex AI) y cómo se estructuraría el
+pipeline de **CI/CD en Azure DevOps**, con foco en el despliegue seguro de las
+migraciones de base de datos.
 
 ---
 
-# Puesta en marcha local
+# Descarga y puesta en marcha
 
 ## Requisitos previos
 
-Verifica que tienes instalado (o instálalo):
+Verifica que tienes instalado:
 
-- **Python 3.11+** — comprueba con `python --version`
+- **Python 3.11+** — `python --version`
 - **Git** — `git --version`
 - **Docker Desktop** — `docker --version` (debe estar abierto y corriendo)
-- **Ollama** — `ollama --version` (el motor que corre la IA en local)
+- **Ollama** — `ollama --version`
 
-## Paso 1 — Clonar el repositorio
+## Opción A — Todo con Docker (recomendada)
 
+Es la forma más simple: un solo comando levanta la base, corre las migraciones e
+inicia la API.
+
+**1. Clonar el repositorio:**
 ```bash
 git clone https://github.com/TU-USUARIO/insight-extractor.git
 cd insight-extractor
 ```
 
-## Paso 2 — Crear el entorno virtual e instalar dependencias
-
-```bash
-python -m venv venv
-# Windows:
-.\venv\Scripts\Activate.ps1
-# Linux/Mac:
-source venv/bin/activate
-
-pip install -r requirements.txt
-```
-
-> En Windows, si al activar sale un error de permisos, ejecuta una vez:
-> `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`
-
-## Paso 3 — Configurar las variables de entorno
-
+**2. Configurar las variables de entorno:**
 ```bash
 cp .env.example .env      # Windows: Copy-Item .env.example .env
 ```
 
-## Paso 4 — Descargar el modelo de IA
-
+**3. Descargar el modelo de IA:**
 ```bash
 ollama pull qwen2.5:7b
 ```
+> Si Ollama falla por un error de GPU/CUDA, fuérzalo a usar el procesador:
+> en Windows ejecuta `setx OLLAMA_NUM_GPU 0`, reinicia Ollama y vuelve a intentar.
 
-> Si Ollama falla al arrancar el modelo por un error de GPU/CUDA, fuérzalo a usar
-> el procesador (CPU): en Windows ejecuta `setx CUDA_VISIBLE_DEVICES ""`, reinicia
-> Ollama y vuelve a intentar. Es más lento pero estable.
+**4. Levantar todo el sistema:**
+```bash
+docker compose up --build
+```
+Espera a ver el mensaje `Application startup complete`. La API queda disponible en
+`http://localhost:8000`.
 
-## Paso 5 — Levantar la base de datos PostgreSQL
+**5. (Opcional) Cargar datos de demostración:**
+
+En otra terminal, con un entorno de Python y las dependencias instaladas:
+```bash
+python seed_demo.py
+```
+Esto carga 4 canales con datos creíbles (Facebook rinde bien, TikTok pierde) para
+que la demo sea presentable.
+
+## Opción B — API en local (para desarrollo)
+
+Útil si quieres modificar el código y ver los cambios al instante.
 
 ```bash
-docker compose up -d
-docker compose ps          # el contenedor "insight_db" debe verse "healthy"
+# 1. Entorno virtual e instalación de dependencias
+python -m venv venv
+.\venv\Scripts\Activate.ps1        # Windows
+# source venv/bin/activate          # Linux/Mac
+pip install -r requirements.txt
+
+# 2. Levantar solo la base de datos con Docker
+docker compose up -d db
+
+# 3. Aplicar las migraciones
+alembic upgrade head
+
+# 4. Cargar datos de demostración
+python seed_demo.py
+
+# 5. Iniciar la API
+cd src
+uvicorn main:app --reload
 ```
 
-## Paso 6 — Crear las tablas y la vista de KPIs
+## Cómo usar la API
 
-```bash
-python -c "from dotenv import load_dotenv; load_dotenv(); import sys; sys.path.insert(0,'src/data'); import models; models.init_db()"
+Con la API corriendo, abre en el navegador:
+
+```
+http://localhost:8000/docs
 ```
 
-Comprobar que se crearon:
+Es la interfaz interactiva de FastAPI, donde puedes probar los tres endpoints con
+botones. Orden sugerido:
 
-```bash
-docker exec -it insight_db psql -U insight -d insight_db -c "\dt"   # tablas
-docker exec -it insight_db psql -U insight -d insight_db -c "\dv"   # vista
-```
-
-## Paso 7 — Crear el usuario de solo lectura (una sola vez)
-
-Es el usuario restringido que usará el agente de IA:
-
-```bash
-docker exec -it insight_db psql -U insight -d insight_db -c "CREATE USER insight_ro WITH PASSWORD 'readonly_pass';"
-docker exec -it insight_db psql -U insight -d insight_db -c "GRANT CONNECT ON DATABASE insight_db TO insight_ro;"
-docker exec -it insight_db psql -U insight -d insight_db -c "GRANT USAGE ON SCHEMA public TO insight_ro;"
-docker exec -it insight_db psql -U insight -d insight_db -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO insight_ro;"
-docker exec -it insight_db psql -U insight -d insight_db -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO insight_ro;"
-```
-
-## Paso 8 — Cargar datos de ejemplo
-
-```bash
-python test_fase1_completa.py
-```
-
-Ver los KPIs calculados:
-
-```bash
-docker exec -it insight_db psql -U insight -d insight_db -P pager=off -c "SELECT channel_code, total_sales_amount, marketing_spend, roi, cac, conversion_rate FROM vw_campaign_kpis ORDER BY channel_code;"
-```
-
-## Paso 9 — Probar el agente de IA
-
-Con Ollama corriendo:
-
-```bash
-python -c "from dotenv import load_dotenv; load_dotenv(); import sys; sys.path[:0]=['src/ai','src/data']; from agent import run_agent; import json; print(json.dumps(run_agent('¿Cuál es el ROI por canal?'), ensure_ascii=False, indent=2, default=str))"
-```
-
----
-
-## Variables de entorno
-
-| Variable | Para qué sirve |
-|---|---|
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credenciales de la base (usuario administrador). |
-| `POSTGRES_HOST` / `POSTGRES_PORT` | Dónde está la base (`localhost` en local, `db` dentro de Docker). |
-| `POSTGRES_RO_USER` / `POSTGRES_RO_PASSWORD` | Usuario de solo lectura para el agente. |
-| `OLLAMA_MODEL` | Qué modelo de IA usar (`qwen2.5:7b`). |
-| `OLLAMA_BASE_URL` | Dónde está corriendo Ollama (`http://localhost:11434`). |
+1. **GET /metrics** — el más simple, no usa IA. Devuelve los KPIs actuales.
+2. **POST /data/ingest** — para cargar datos. Ejemplo de cuerpo:
+   ```json
+   {
+     "sales": [
+       {"transaction_id": "t1", "customer_code": "c1", "amount": 300,
+        "event_date": "2026-08-03", "channel": "FB Ads", "clicks": 12,
+        "is_new_customer": true}
+     ]
+   }
+   ```
+3. **POST /chat** — para hablar con el agente (requiere Ollama corriendo). Ejemplo:
+   ```json
+   {"question": "¿En qué canal debería invertir más y en cuál menos?"}
+   ```
 
 ---
 
@@ -557,35 +460,37 @@ python -c "from dotenv import load_dotenv; load_dotenv(); import sys; sys.path[:
 insight-extractor/
 ├── src/
 │   ├── data/
-│   │   ├── models.py          # Las tablas, el histórico y la vista de KPIs
-│   │   ├── pipeline.py        # La carga de datos y unificación de fuentes
-│   │   └── validator.py       # El filtro de calidad (gobernanza)
+│   │   ├── models.py          # Tablas SQLAlchemy, SCD2 y vista de KPIs
+│   │   ├── pipeline.py        # Ingesta multi-fuente y unificación
+│   │   └── validator.py       # Gobernanza / calidad con Pydantic
 │   ├── ai/
-│   │   ├── agent.py           # El agente de IA (las tres estaciones)
-│   │   └── tools.py           # El acceso seguro de solo lectura a la base
-│   └── main.py                # La API web — Fase 3
+│   │   ├── agent.py           # Grafo LangGraph (intención, SQL, razonamiento)
+│   │   └── tools.py           # Ejecutor SQL seguro (read-only + lista blanca)
+│   └── main.py                # API FastAPI con los tres endpoints
 ├── data_sources/
-│   ├── marketing_spend.csv    # Fuente B en formato archivo (CSV)
-│   └── marketing_spend_api.json # Fuente B en formato API (JSON)
-├── migrations/                # Migraciones de base de datos — Fase 3
-├── docker-compose.yml         # Levanta la base de datos (y la app en Fase 3)
-├── Dockerfile                 # Fase 3
-├── requirements.txt           # Lista de dependencias de Python
-├── .env.example               # Plantilla de configuración
+│   ├── marketing_spend.csv    # Fuente B (archivo estructurado)
+│   └── marketing_spend_api.json # Fuente B (API simulada)
+├── migrations/                # Migraciones de Alembic
+│   ├── env.py
+│   └── versions/
+│       └── 0001_initial_schema.py
+├── seed_demo.py               # Carga datos de demostración
+├── docker-compose.yml         # Levanta BD + API
+├── Dockerfile
+├── entrypoint.sh              # Espera BD, migra y arranca la API
+├── alembic.ini
+├── requirements.txt
+├── .env.example
 ├── README.md
-└── ARCHITECTURE.md            # Diseño de escalado — Fase 3
+└── ARCHITECTURE.md            # Escalado en GCP y CI/CD en Azure DevOps
 ```
 
----
+## Variables de entorno
 
-## Estado del proyecto
-
-- [x] **Fase 0 — Entorno:** Python, Git, Docker y Ollama configurados.
-- [x] **Fase 1 — Datos y gobernanza:** dos fuentes (ventas + inversión en CSV y
-      API), filtro de calidad completo, histórico de cambios en dos catálogos,
-      tabla principal y KPIs funcionando de principio a fin.
-- [x] **Seguridad — Usuario de solo lectura** creado y verificado.
-- [x] **Fase 2 — Agente de IA:** las tres estaciones funcionando, doble candado de
-      seguridad y manejo honesto de datos faltantes.
-- [ ] **Fase 3 — API y despliegue:** endpoints FastAPI, Docker completo,
-      migraciones y documento de arquitectura.
+| Variable | Descripción |
+|---|---|
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credenciales de la base (usuario administrador). |
+| `POSTGRES_HOST` / `POSTGRES_PORT` | Host y puerto (`localhost` en local, `db` dentro de Docker). |
+| `POSTGRES_RO_USER` / `POSTGRES_RO_PASSWORD` | Usuario de solo lectura para el agente. |
+| `OLLAMA_MODEL` | Modelo de Ollama (`qwen2.5:7b`). |
+| `OLLAMA_BASE_URL` | URL del servidor Ollama. |
