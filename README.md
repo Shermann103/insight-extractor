@@ -110,15 +110,32 @@ Todo el esquema se define con **SQLAlchemy** en `src/data/models.py`. Consta de
 tres tablas y una vista:
 
 ```
-   dim_channel (SCD tipo 2)              dim_customer (SCD tipo 2)
-   catálogo de canales + tarifas         catálogo de clientes
-          │
-          │ 1 canal → N filas de hechos (clave foránea channel_id)
-          ▼
-   fact_campaign_performance  ← unifica Fuente A (ventas) + Fuente B (inversión)
-          │
-          ▼
-   vw_campaign_kpis  → calcula ROI, CAC y conversión (vista, no tabla)
+   dim_channel (catálogo canales)         dim_customer (catálogo clientes)
+   ┌───────────────────────────┐          ┌───────────────────────────┐
+   │ nombre del canal          │          │ código del cliente        │
+   │ costo por clic (CPC)      │          │ segmento, ciudad          │
+   │ desde / hasta / vigente   │          │ desde / hasta / vigente   │
+   └─────────────┬─────────────┘          └───────────────────────────┘
+                 │
+                 │  un canal aparece en muchos días
+                 │
+                 ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │ fact_campaign_performance (tabla principal de datos)    │
+   │                                                         │
+   │ fecha + canal  ← identifican cada fila (sin duplicados) │
+   │ ventas totales        ← viene de la Fuente A            │
+   │ inversión (gasto)     ← viene de la Fuente B            │
+   │ nº transacciones      ← Fuente A                        │
+   │ nº clientes nuevos    ← Fuente A                        │
+   │ nº de clics           ← Fuente A + Fuente B (se suman)  │
+   └─────────────────────────────┬───────────────────────────┘
+                                 │
+                                 ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │ vw_campaign_kpis (vista que calcula los indicadores)    │
+   │ ROI · CAC · Tasa de conversión                          │
+   └─────────────────────────────────────────────────────────┘
 ```
 
 ### Tabla de hechos: `fact_campaign_performance`
@@ -199,22 +216,31 @@ código hace el flujo predecible y seguro.
 
 ```
    Pregunta del usuario
-          │
-          ▼
-   [ Nodo 1: Clasificación de intención ]
-          │  (se bifurca según la intención)
-      ┌───┴────────────┐
-      ▼                ▼
- (actualización)   (datos / análisis)
-      │                ▼
-      │      [ Nodo 2: Text-to-SQL ]
-      │                │
-      └───────┬────────┘
-              ▼
-   [ Nodo 3: Razonamiento y recomendación ]
-              │
-              ▼
-          Respuesta (texto + JSON)
+            │
+            ▼
+   ┌──────────────────┐
+   │ 1. Intención     │  ¿datos, análisis o actualización?
+   └────────┬─────────┘
+            │
+            │  (Bifurcación según la intención)
+            │
+      ┌─────┴─────────────────┐
+      │                       │
+      │                       ▼
+      │               (datos / análisis)
+      │                       │
+  (actualización)       ┌─────────────┐
+      │                 │ 2. Text-to- │   Traduce a SQL 
+      │                 │    SQL      │  y ejecuta seguro
+      │                 └──────┬──────┘
+      │                        │
+      └───────────┬────────────┘
+                  ▼
+          ┌──────────────┐
+          │ 3. Razonar   │  genera diagnóstico + JSON
+          └──────┬───────┘
+                 ▼
+             Respuesta
 ```
 
 **Nodo 1 — Clasificación de intención.** Le pregunta al modelo si la consulta del
