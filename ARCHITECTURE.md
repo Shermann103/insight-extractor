@@ -11,14 +11,14 @@ API), lo que facilita mapear cada pieza a un servicio gestionado en la nube.
 
 ## 1. Escalado en Google Cloud Platform (GCP)
 
-La idea es reemplazar cada componente local por un servicio gestionado que escale
+La idea es reemplazar cada componente local por un servicio gestionado y escala
 solo y reduzca el mantenimiento.
 
 ### Mapeo de componentes
 
 | Componente local | Servicio en GCP | Función |
 |---|---|---|
-| API FastAPI (contenedor) | **Cloud Run** | Ejecuta la API en contenedores que escalan automáticamente (incluso a cero). |
+| API FastAPI (contenedor) | **Cloud Run** | Ejecuta la API en contenedores que escalan automáticamente. |
 | PostgreSQL (contenedor) | **Cloud SQL for PostgreSQL** | Base transaccional gestionada, con backups y alta disponibilidad. |
 | Analítica a gran escala | **BigQuery** | Almacén analítico para históricos masivos y consultas de KPIs sobre millones de filas. |
 | Gobernanza / transformación | **dbt** | Versiona y prueba las transformaciones y los KPIs como código. |
@@ -27,28 +27,27 @@ solo y reduzca el mantenimiento.
 ### Cómo encaja cada uno
 
 **Cloud Run (la API).** El `Dockerfile` que ya tenemos se despliega tal cual.
-Cloud Run levanta más instancias cuando sube el tráfico y las baja cuando
-disminuye, cobrando solo por uso. Es la evolución natural de nuestro contenedor
-`api`.
+Mientras que con Cloud Run se levantan más instancias cuando sube el tráfico 
+y las baja cuando disminuye, cobrando solo por uso.
 
 **Cloud SQL (la base transaccional).** Reemplaza al contenedor de PostgreSQL sin
-cambiar el código: seguimos usando SQLAlchemy y la misma URL de conexión, solo
-cambia el host. Aquí viven las tablas operativas (dimensiones, hechos) y el
+cambiar el código: se sigue usando SQLAlchemy y la misma URL de conexión, solo
+cambia el host. Aquí están las tablas operativas (dimensiones, hechos) y el
 usuario de solo lectura.
 
 **BigQuery (la analítica).** A medida que el histórico crece a millones de filas,
-las consultas de KPIs pesan sobre la base transaccional. La solución es replicar
-los datos hacia BigQuery (un almacén columnar hecho para analítica) y calcular ahí
-los KPIs pesados. Cloud SQL queda para la operación del día a día; BigQuery para
-los análisis grandes.
+las consultas de KPIs pesan sobre la base transaccional. Para responder a esto se 
+replican los datos hacia BigQuery (un almacén columnar de analítica) para así ahí
+calcular los KPIs pesados. Cloud SQL queda para operaciones del día a día, mientras 
+que BigQuery quedaría para los análisis grandes.
 
-**dbt (la gobernanza como código).** Nuestra lógica de KPIs (la vista
-`vw_campaign_kpis`) y las reglas de calidad se migrarían a modelos de dbt. La
-ventaja: las transformaciones quedan versionadas en Git, con pruebas automáticas
+**dbt (la gobernanza como código).** La lógica de KPIs actual (la vista
+`vw_campaign_kpis`) y las reglas de calidad se migrarían a modelos de dbt.
+Ventaja: las transformaciones quedan versionadas en Git, con pruebas automáticas
 de calidad de datos (no nulos, unicidad, rangos válidos) que se ejecutan en cada
-cambio. Es la versión "empresarial" de nuestra capa de gobernanza actual.
+cambio.
 
-**Vertex AI (el modelo de IA).** En local usamos Ollama por costo cero. En
+**Vertex AI (el modelo de IA).** En actualmente usamos Ollama por ser gratis. En
 producción, el modelo se serviría desde Vertex AI, que ofrece un endpoint
 gestionado, escalable y con control de acceso. El agente LangGraph no cambiaría su
 lógica; solo apuntaría a ese endpoint en lugar de a Ollama.
@@ -92,14 +91,14 @@ mal, pueden romper datos en producción).
 
 - **Migraciones primero, con red de seguridad.** Antes de desplegar el código
   nuevo, correr `alembic upgrade head` contra la base. Como las migraciones son
-  el paso más riesgoso, se ejecutan en un *job* aislado que:
+  el paso más arriesgado, se ejecutan en un *job* aislado que:
   - primero corre contra un entorno de *staging* (copia de producción),
   - hace un *backup* de la base de producción antes de aplicar nada,
   - solo entonces aplica la migración en producción.
 - **Despliegue del código.** Una vez la base está migrada, se despliega la nueva
-  imagen a Cloud Run (o al destino que sea) con una estrategia gradual
-  (*canary* o *blue-green*): el tráfico se mueve poco a poco a la versión nueva,
-  y si algo falla, se revierte automáticamente.
+  imagen a Cloud Run con una estrategia gradual (*canary* o *blue-green*):
+  el tráfico se mueve poco a poco a la versión nueva, y si algo falla, se
+  revierte automáticamente.
 
 ### Seguridad y buenas prácticas
 
@@ -137,8 +136,8 @@ mal, pueden romper datos en producción).
 
 ## Resumen
 
-El sistema local ya está diseñado con las fronteras correctas (API, datos, IA
-separados), por lo que escalar consiste en **reemplazar cada pieza por su
+Como el sistema local ya está diseñado por partes (API, datos, IA
+separados), esto hace que escalar consista en **reemplazar cada pieza por su
 equivalente gestionado** en GCP, sin reescribir la lógica de negocio. El pipeline
 de Azure DevOps prioriza la seguridad de las migraciones de base de datos, que son
 el punto más delicado de cualquier despliegue con estado.
